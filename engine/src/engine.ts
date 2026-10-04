@@ -8832,16 +8832,31 @@ export class Engine {
    * while pinned; hosts typically cover it with an export overlay. Pass null to
    * return to CSS-size × devicePixelRatio tracking. Applies immediately (targets
    * rebuild before this returns), so the next render() is at the new size.
+   * Non-finite sizes or sizes above the device's texture limit throw RangeError;
+   * an explicit export size is never silently reduced. Before init, the device
+   * limit is checked when the requested size is first applied.
    */
   setRenderSize(width: number, height: number): void
   setRenderSize(size: null): void
   setRenderSize(widthOrNull: number | null, height?: number): void {
-    this.fixedRenderSize =
+    if (widthOrNull !== null && (!Number.isFinite(widthOrNull) || !Number.isFinite(height ?? 1))) {
+      throw new RangeError("Render size must be finite")
+    }
+    const size =
       widthOrNull === null
         ? null
         : { width: Math.max(1, Math.floor(widthOrNull)), height: Math.max(1, Math.floor(height ?? 1)) }
+    if (size) this.validateRenderSize(size)
+    this.fixedRenderSize = size
     this.resizePending = false
     this.handleResize()
+  }
+
+  private validateRenderSize(size: { width: number; height: number }) {
+    const limit = this.device?.limits.maxTextureDimension2D ?? Infinity
+    if (size.width > limit || size.height > limit) {
+      throw new RangeError(`Render size ${size.width}×${size.height} exceeds the supported texture dimensions (limit ${limit})`)
+    }
   }
 
   private handleResize() {
@@ -8865,8 +8880,15 @@ export class Engine {
     if (this.initPipelineJobs) return
     // Fixed override (offline/video rendering) wins; otherwise track CSS size × dpr.
     const dpr = window.devicePixelRatio || 1
-    const width = this.fixedRenderSize ? this.fixedRenderSize.width : Math.floor(this.canvas.clientWidth * dpr)
-    const height = this.fixedRenderSize ? this.fixedRenderSize.height : Math.floor(this.canvas.clientHeight * dpr)
+    if (this.fixedRenderSize) this.validateRenderSize(this.fixedRenderSize)
+    const requestedWidth = this.fixedRenderSize?.width ?? Math.max(1, Math.floor(this.canvas.clientWidth * dpr))
+    const requestedHeight = this.fixedRenderSize?.height ?? Math.max(1, Math.floor(this.canvas.clientHeight * dpr))
+    // Fit high-DPI windows within the device limit without changing aspect ratio.
+    // A hidden canvas still needs a valid, nonzero backing store.
+    const limit = this.device.limits.maxTextureDimension2D
+    const scale = Math.min(1, limit / requestedWidth, limit / requestedHeight)
+    const width = Math.max(1, Math.floor(requestedWidth * scale))
+    const height = Math.max(1, Math.floor(requestedHeight * scale))
 
     if (!this.multisampleTexture || this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width
@@ -15324,8 +15346,9 @@ export class Engine {
       this.onRaycast?.("", null, null, screenX, screenY)
       return
     }
-    const dpr = window.devicePixelRatio || 1
-    this.pendingPick = { x: Math.floor(screenX * dpr), y: Math.floor(screenY * dpr) }
+    // Keep CSS coordinates for the callback; the render pass maps them into
+    // the actual backing store, which can be capped or explicitly sized.
+    this.pendingPick = { x: screenX, y: screenY }
   }
 
   private renderSelectionPasses(encoder: GPUCommandEncoder, swapchainView: GPUTextureView): void {
@@ -16241,8 +16264,9 @@ export class Engine {
     pass.end()
 
     // Copy the single pixel under cursor to readback buffer
-    const px = Math.min(this.pendingPick.x, this.pickTexture.width - 1)
-    const py = Math.min(this.pendingPick.y, this.pickTexture.height - 1)
+    const rect = this.canvas.getBoundingClientRect()
+    const px = Math.min(Math.floor(this.pendingPick.x * this.pickTexture.width / Math.max(1, rect.width)), this.pickTexture.width - 1)
+    const py = Math.min(Math.floor(this.pendingPick.y * this.pickTexture.height / Math.max(1, rect.height)), this.pickTexture.height - 1)
     encoder.copyTextureToBuffer(
       { texture: this.pickTexture, origin: { x: Math.max(0, px), y: Math.max(0, py) } },
       { buffer: this.pickReadbackBuffer, bytesPerRow: 256 },
@@ -16722,8 +16746,7 @@ export class Engine {
 
     if (pick) {
       this.pendingPick = null
-      const dpr = window.devicePixelRatio || 1
-      this.resolvePickResult(pick.x / dpr, pick.y / dpr)
+      this.resolvePickResult(pick.x, pick.y)
     }
 
     // Feed the true vsync-to-vsync interval (deltaTime, computed at frame start), not the

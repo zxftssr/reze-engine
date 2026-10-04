@@ -1116,6 +1116,7 @@ export default function Home() {
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
       <Header stats={stats} engineRef={engineRef} />
+      <a href="/gwen" className="absolute left-6 top-20 z-[60] rounded-full bg-black/60 px-5 py-2 text-sm text-white">角色模型展示 →</a>
 
       {engineError && (
         <div className="absolute inset-0 w-full h-full flex items-center justify-center text-white p-6 z-50 text-lg font-medium">

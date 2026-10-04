@@ -2,6 +2,7 @@
 // Compile every emitted shader on a REAL WebGPU device, headlessly.
 //
 //   node --import ./tests/register.mjs tools/validate-wgsl.mjs
+// Add --html-only to generate a page for an existing browser (serve it on localhost).
 //
 // The npm-test suite reads emitted STRINGS — it can name-check and layout-check
 // but it cannot compile WGSL, so a type error in a rewritten sampler sails
@@ -22,7 +23,7 @@ import { fileURLToPath } from "node:url"
 const here = dirname(fileURLToPath(import.meta.url))
 const dist = join(here, "..", "dist")
 
-const { COMMON_MATERIAL_PRELUDE_WGSL } = await import(`${dist}/shaders/materials/common.js`)
+const { COMMON_MATERIAL_PRELUDE_WGSL, DISSOLVE_WGSL } = await import(`${dist}/shaders/materials/common.js`)
 const { compileGraph } = await import(`${dist}/graph/compile.js`)
 const { DEFAULT_GRAPH } = await import(`${dist}/graph/presets/default.js`)
 const { groundShaderWgsl } = await import(`${dist}/shaders/passes/ground.js`)
@@ -75,7 +76,7 @@ shaders["editor overlay"] = OVERLAY_SHADER_WGSL
 // loop — so the prelude compiles as hand-written presets use it, not only as
 // the graph generator wraps it.
 shaders["material prelude + minimal fs"] =
-  COMMON_MATERIAL_PRELUDE_WGSL +
+  COMMON_MATERIAL_PRELUDE_WGSL + DISSOLVE_WGSL +
   `
 @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
   let n = safe_normal(input.normal);
@@ -138,6 +139,7 @@ for (const file of fixtures) {
   if (pep.init && pep.step && pep.shade) {
     const src = {
       wgsl,
+      paramsDecl: "",
       count: Math.min(declared(source).particles, 4096) || 64,
       blend: declared(source).particleBlend,
       bloom: declared(source).bloom,
@@ -148,7 +150,7 @@ for (const file of fixtures) {
   const tep = trailEntryPoints(wgsl)
   if (tep.width && tep.shade) {
     shaders[`${name}: trail`] = buildTrailShader(
-      { wgsl, slots: trailed.length, ribbonSlots: trailed, blend: "additive", bloom: true },
+      { wgsl, paramsDecl: "", slots: trailed.length, ribbonSlots: trailed, blend: "additive", bloom: true },
       cast,
     )
   }
@@ -157,7 +159,18 @@ for (const file of fixtures) {
   }
 }
 
+// Compile every shipped graph preset, including the non-default material paths.
+for (const file of readdirSync(`${dist}/graph/presets`).filter((f) => f.endsWith(".js"))) {
+  const presets = await import(`${dist}/graph/presets/${file}`)
+  for (const [name, graph] of Object.entries(presets)) {
+    const result = compileGraph(graph, { renderClass: "auto", alphaMode: "opaque" })
+    if (!result.ok) throw new Error(`${name}: ${JSON.stringify(result.diagnostics)}`)
+    shaders[`preset ${name}`] = result.wgsl
+  }
+}
+
 // ── Hand them to a real device ──
+const htmlOnly = process.argv.includes("--html-only")
 const work = mkdtempSync(join(tmpdir(), "wgsl-validate-"))
 // Base64-inlined rather than fetched: file:// fetch is CORS-blocked in
 // headless Chrome whatever the flags say, and escaping WGSL into a script tag
@@ -165,30 +178,36 @@ const work = mkdtempSync(join(tmpdir(), "wgsl-validate-"))
 const payload = Buffer.from(JSON.stringify(shaders), "utf8").toString("base64")
 writeFileSync(
   join(work, "validate.html"),
-  `<!doctype html><script type="module">
+  `<!doctype html><meta name="google" content="notranslate"><body><pre id="results"></pre><script type="module">
+const log = (message) => { console.log(message); document.getElementById("results").textContent += message + "\\n" }
 const shaders = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob("${payload}"), (c) => c.charCodeAt(0))))
 const adapter = await navigator.gpu?.requestAdapter()
-if (!adapter) { console.log("WGSL-VALIDATE FATAL: no adapter"); }
+if (!adapter) { log("WGSL-VALIDATE FATAL: no adapter"); }
 else {
   const device = await adapter.requestDevice()
-  window.onerror = (m) => console.log("WGSL-VALIDATE FATAL: " + m)
+  window.onerror = (m) => log("WGSL-VALIDATE FATAL: " + m)
   for (const [name, code] of Object.entries(shaders)) {
     try {
-      if (typeof code !== "string") { console.log("WGSL-VALIDATE ERROR: " + name + " builder returned " + typeof code); continue }
+      if (typeof code !== "string") { log("WGSL-VALIDATE ERROR: " + name + " builder returned " + typeof code); continue }
       const mod = device.createShaderModule({ code })
       const info = await mod.getCompilationInfo()
       const errors = info.messages.filter((m) => m.type === "error")
-      if (errors.length === 0) console.log("WGSL-VALIDATE OK: " + name)
-      for (const e of errors) console.log("WGSL-VALIDATE ERROR: " + name + " @" + e.lineNum + ":" + e.linePos + " " + e.message)
+      if (errors.length === 0) log("WGSL-VALIDATE OK: " + name)
+      for (const e of errors) log("WGSL-VALIDATE ERROR: " + name + " @" + e.lineNum + ":" + e.linePos + " " + e.message)
     } catch (e) {
-      console.log("WGSL-VALIDATE ERROR: " + name + " threw: " + e.message)
+      log("WGSL-VALIDATE ERROR: " + name + " threw: " + e.message)
     }
   }
-  console.log("WGSL-VALIDATE DONE " + Object.keys(shaders).length)
+  log("WGSL-VALIDATE DONE " + Object.keys(shaders).length)
 }
-window.close()
+${htmlOnly ? "" : "window.close()"}
 </script></html>`,
 )
+
+if (htmlOnly) {
+  console.log(join(work, "validate.html"))
+  process.exit(0)
+}
 
 const chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 // No --virtual-time-budget: it fast-forwards timers and exits while REAL async
@@ -199,7 +218,7 @@ let out = ""
 try {
   out = execFileSync(
     "bash",
-    ["-c", `"${chrome}" --headless=new --enable-unsafe-webgpu --enable-logging=stderr --v=0 --no-sandbox "file://${join(work, "validate.html")}" 2>&1`],
+    ["-c", `"${chrome}" --headless=new --enable-logging=stderr --v=0 "file://${join(work, "validate.html")}" 2>&1`],
     { encoding: "utf8", timeout: 90_000 },
   )
 } catch (e) {

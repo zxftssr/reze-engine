@@ -40,3 +40,9 @@ blender-*.tar.xz
 # Test fixtures that are someone else's model. MMD models carry
 # redistribution terms; the round-trip test skips when this is absent.
 engine/tests/fixtures/*.pmx
+
+# Gwen model is for local use; its author prohibits reposting.
+/web/public/models/gwen/
+
+# Downloaded character models and author resources: local use only.
+/web/public/models/local-characters/

@@ -163,21 +163,62 @@ test("non-vertex morph payloads survive parsing", { skip: MODELS.length === 0 },
   }
 })
 
-test("a material morph that zeroes alpha is readable as an off switch", { skip: MODELS.length === 0 }, () => {
-  // The specific shape every "hide this part" switch takes: multiply mode with
-  // a zero alpha, so weight 1 lands on alpha 0. If this stops parsing, parts
-  // stop hiding — silently, because the morph still appears in the list.
-  let found = 0
-  for (const path of MODELS) {
-    const model = PmxLoader.loadFromBuffer(toAB(readFileSync(path)))
-    for (const morph of model.getMorphing().morphs) {
-      if (morph.type !== 8) continue
-      for (const off of morph.materialOffsets ?? []) {
-        if (off.offsetType === 0 && off.diffuse[3] === 0) found++
-      }
-    }
+// Complete PMX 2.0 stream with one material and two material morphs. Empty
+// geometry keeps it small; all section counts and payloads are present.
+function materialMorphFixture() {
+  const chunks = []
+  const u8 = (n) => chunks.push(Buffer.from([n]))
+  const i32 = (n) => { const b = Buffer.alloc(4); b.writeInt32LE(n); chunks.push(b) }
+  const floats = (...values) => {
+    const b = Buffer.alloc(values.length * 4)
+    values.forEach((n, i) => b.writeFloatLE(n, i * 4))
+    chunks.push(b)
   }
-  assert.ok(found > 0, "no model on disk carries an alpha-zeroing material morph to check against")
+  const text = (s) => { const b = Buffer.from(s); i32(b.length); chunks.push(b) }
+  chunks.push(Buffer.from("PMX "))
+  floats(2)
+  // UTF-8, no extra UVs, one-byte indices for every index category.
+  for (const n of [8, 1, 0, 1, 1, 1, 1, 1, 1]) u8(n)
+  for (const s of ["material morph fixture", "", "", ""]) text(s)
+  for (let i = 0; i < 3; i++) i32(0) // vertices, indices, textures
+  i32(1) // material count
+  text("part"); text("")
+  floats(1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0) // diffuse, specular, power, ambient
+  u8(0); floats(0, 0, 0, 1, 1) // flags, edge color/size
+  for (const n of [255, 255, 0, 0, 255]) u8(n) // textures, sphere mode, toon
+  text(""); i32(0) // memo, material surface count
+  i32(1) // one root bone, required by Model
+  text("root"); text(""); floats(0, 0, 0)
+  u8(255); i32(0); u8(0); u8(0) // parent -1, layer, uint16 flags
+  floats(0, 1, 0) // tail offset
+  i32(2) // morphs: multiply on one material, additive on all materials
+  for (const [name, material, mode] of [["hide part", 0, 0], ["all parts", 255, 1]]) {
+    text(name); text(""); u8(4); u8(8); i32(1) // panel, type, offset count
+    u8(material); u8(mode)
+    floats(1, 0.5, 0.25, 0) // diffuse alpha must survive as zero
+    floats(0.25, 0.5, 0.75, 2, 0.125, 0.25, 0.5) // specular, power, ambient
+    floats(1, 0.5, 0.25, 1, 0.5) // edge color/size
+    floats(1, 1, 1, 1, 0.5, 0.5, 0.5, 1, 0.25, 0.25, 0.25, 1)
+  }
+  for (let i = 0; i < 3; i++) i32(0) // display frames, rigid bodies, joints
+  return toAB(Buffer.concat(chunks))
+}
+
+test("a material morph that zeroes alpha is readable as an off switch", () => {
+  const model = PmxLoader.loadFromBuffer(materialMorphFixture())
+  assert.deepEqual(model.getLoadWarnings(), [])
+  assert.equal(model.getMaterials().length, 1)
+  const morphs = model.getMorphing().morphs
+  assert.deepEqual(morphs.map((m) => [m.name, m.type]), [["hide part", 8], ["all parts", 8]])
+  for (const [i, morph] of morphs.entries()) {
+    assert.equal(morph.materialOffsets.length, 1)
+    assert.deepEqual(morph.materialOffsets[0], {
+      materialIndex: i === 0 ? 0 : -1, offsetType: i,
+      diffuse: [1, 0.5, 0.25, 0], specular: [0.25, 0.5, 0.75], shininess: 2,
+      ambient: [0.125, 0.25, 0.5], edgeColor: [1, 0.5, 0.25, 1], edgeSize: 0.5,
+      textureCoeff: [1, 1, 1, 1], sphereCoeff: [0.5, 0.5, 0.5, 1], toonCoeff: [0.25, 0.25, 0.25, 1],
+    })
+  }
 })
 
 test("only actionable morphs are offered", { skip: MODELS.length === 0 }, () => {
